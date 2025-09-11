@@ -15,7 +15,10 @@ param(
     [Parameter(Mandatory=$false)]
     [string[]] $Drives = @([System.IO.Path]::GetPathRoot($env:SystemDrive)),
 
+    [ValidateRange(1,3650)]
     [int] $AgeDays = 30,
+
+    [ValidateRange(1,524288)] # up to 512GB
     [int] $LargeFileMinMB = 512,
 
     [switch] $IncludeDupScan,
@@ -54,6 +57,9 @@ function Try-MeasurePath {
         [string[]]$Include = @('*'),
         [switch]$Recurse
     )
+    # Ensure -Include is effective by defaulting to recurse when caller didn’t specify
+    if (-not $PSBoundParameters.ContainsKey('Recurse')) { $Recurse = $true }
+
     $result = [PSCustomObject]@{
         Path   = $Path
         Exists = $false
@@ -64,7 +70,19 @@ function Try-MeasurePath {
     try {
         if (Test-Path -LiteralPath $Path) {
             $result.Exists = $true
-            $items = Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction Stop -Include $Include -Recurse:$Recurse
+
+            # Use -Include when recursing; otherwise use -Filter to avoid full enumeration cost
+            if ($Recurse) {
+                $items = Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction Stop -Include $Include -Recurse
+            } else {
+                $filter = ($Include -and $Include.Count -eq 1) ? $Include[0] : $null
+                if ($filter) {
+                    $items = Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction Stop -Filter $filter
+                } else {
+                    $items = Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction Stop
+                }
+            }
+
             if ($OlderThanDays -gt 0) {
                 $cutoff = (Get-Date).AddDays(-$OlderThanDays)
                 $items = $items | Where-Object { $_.LastWriteTime -lt $cutoff }
@@ -119,6 +137,21 @@ function Add-Finding {
         $script:PlanCommands.Add($Finding.PlanCommand) | Out-Null
     }
 }
+
+# More accurate Recycle Bin size (no admin required)
+function Get-RecycleBinBytes {
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $rb    = $shell.Namespace(10)  # Recycle Bin
+        if (-not $rb) { return 0L }
+        $bytes = 0L
+        $rb.Items() | ForEach-Object {
+            $sz = $_.ExtendedProperty("Size")
+            if ($sz -is [ValueType]) { $bytes += [int64]$sz }
+        }
+        return $bytes
+    } catch { return 0L }
+}
 #endregion Helpers
 
 $ErrorActionPreference = 'Stop'
@@ -126,9 +159,17 @@ $findings = New-Object System.Collections.Generic.List[object]
 $now = Get-Date
 $admin = Test-Admin
 
+# Validate drives and determine Windows system drive
+$validDrives = $Drives | ForEach-Object { ($_ -replace '[\\/]*$','') + '\' } | Where-Object { Test-Path $_ } | Select-Object -Unique
+if (-not $validDrives) { $validDrives = @([System.IO.Path]::GetPathRoot($env:SystemDrive)) }
+$windowsDrive = Split-Path -Path $env:WINDIR -Qualifier
+
+# Report path with fallback
 if (-not $ReportPath) {
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-    $ReportPath = Join-Path "$env:PUBLIC\Documents" ("DiskWasteReport_{0}_{1}.html" -f $env:COMPUTERNAME, $ts)
+    $publicDocs = Join-Path "$env:PUBLIC\Documents" .
+    $baseDir = (Test-Path $publicDocs) ? $publicDocs : [Environment]::GetFolderPath('MyDocuments')
+    $ReportPath = Join-Path $baseDir ("DiskWasteReport_{0}_{1}.html" -f $env:COMPUTERNAME, $ts)
 }
 if ($GenerateCleanupPlan -and -not $PlanPath) {
     $PlanPath = [System.IO.Path]::ChangeExtension($ReportPath, ".plan.ps1")
@@ -141,13 +182,13 @@ Write-Host "Scanning... (read-only) This may take a few minutes."
 #region Categories
 
 # 1) Temp folders (Windows + per-user)
-$globalTempTargets = @("C:\Windows\Temp","$env:ProgramData\Temp")
+$globalTempTargets = @((Join-Path $windowsDrive "Windows\Temp"), (Join-Path $windowsDrive "ProgramData\Temp"))
 foreach ($t in $globalTempTargets) {
-    $res = Try-MeasurePath -Path $t -OlderThanDays $AgeDays -Recurse
+    $res = Try-MeasurePath -Path $t -OlderThanDays $AgeDays
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Temp (System)' -Path $t -Item 'Files older than threshold' `
             -SizeBytes $res.Bytes -Age $AgeDays -RecommendedAction "Safe to clear older temp files." `
-            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -File -Force -Recurse | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf" -f $t,$AgeDays) `
+            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -File -Force -Recurse | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $t,$AgeDays) `
             -Confidence High)
     }
 }
@@ -155,11 +196,11 @@ foreach ($t in $globalTempTargets) {
 # Per-user Temp
 foreach ($u in Get-UserProfileRoots) {
     $t = Join-Path $u "AppData\Local\Temp"
-    $res = Try-MeasurePath -Path $t -OlderThanDays $AgeDays -Recurse
+    $res = Try-MeasurePath -Path $t -OlderThanDays $AgeDays
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Temp (User)' -Path $t -Item 'Files older than threshold' `
             -SizeBytes $res.Bytes -Age $AgeDays -RecommendedAction "Safe to clear older temp files for this user." `
-            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -File -Force -Recurse | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf" -f $t,$AgeDays) `
+            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -File -Force -Recurse | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $t,$AgeDays) `
             -Confidence High)
     }
 }
@@ -180,88 +221,86 @@ foreach ($u in Get-UserProfileRoots) {
 $browserTargets = $browserTargets | Select-Object -Unique
 foreach ($mask in $browserTargets) {
     foreach ($path in (Resolve-Path $mask -ErrorAction SilentlyContinue)) {
-        $res = Try-MeasurePath -Path $path.Path -Recurse
+        $res = Try-MeasurePath -Path $path.Path
         if ($res.Exists -and $res.Bytes -gt 0) {
             Add-Finding (New-Finding -Category 'Browser Cache' -Path $path.Path -Item 'Cache content' `
                 -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Usually safe to clear; browsers will recreate." `
-                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf" -f $path.Path) `
+                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue" -f $path.Path) `
                 -Confidence High)
         }
     }
 }
 
-# 3) Windows Update cache
-foreach ($d in $Drives) {
-    $wu = Join-Path $d "Windows\SoftwareDistribution\Download"
-    $res = Try-MeasurePath -Path $wu -Recurse
-    if ($res.Exists -and $res.Bytes -gt 0) {
-        $planWU = ("Stop-Service wuauserv,bits -Force -ErrorAction SilentlyContinue`n" +
-                   ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse | Remove-Item -Force -WhatIf`n" -f $wu) +
-                   "Start-Service wuauserv,bits")
-        Add-Finding (New-Finding -Category 'Windows Update Cache' -Path $wu -Item 'Cached update payloads' `
-            -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Safe to clear when Windows Update is stopped." `
-            -PlanCommand $planWU -Confidence High)
-    }
+# 3) Windows Update cache (Windows volume only)
+$wu = Join-Path $windowsDrive "Windows\SoftwareDistribution\Download"
+$res = Try-MeasurePath -Path $wu
+if ($res.Exists -and $res.Bytes -gt 0) {
+    $planWU = @"
+# Stop services to safely clear Windows Update cache
+Stop-Service DoSvc -Force -ErrorAction SilentlyContinue
+Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+Stop-Service bits -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Get-ChildItem -LiteralPath '$wu' -Force -Recurse | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue
+# Restart services
+Start-Service bits -ErrorAction SilentlyContinue
+Start-Service wuauserv -ErrorAction SilentlyContinue
+Start-Service DoSvc -ErrorAction SilentlyContinue
+"@
+    Add-Finding (New-Finding -Category 'Windows Update Cache' -Path $wu -Item 'Cached update payloads' `
+        -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Safe to clear when Windows Update is stopped." `
+        -PlanCommand $planWU -Confidence High)
 }
 
-# 4) Recycle Bin (per drive)
-if ($admin) {
-    foreach ($d in $Drives) {
-        try {
-            $rb = Join-Path $d '$Recycle.Bin'
-            $res = Try-MeasurePath -Path $rb -Recurse
-            if ($res.Exists -and $res.Bytes -gt 0) {
-                Add-Finding (New-Finding -Category 'Recycle Bin' -Path $rb -Item 'Deleted items' `
-                    -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Empty Recycle Bin to reclaim space." `
-                    -PlanCommand "Clear-RecycleBin -Force -WhatIf" -Confidence High)
-            }
-        } catch {}
-    }
+# 4) Recycle Bin (per machine – accurate shell size)
+$rbBytes = Get-RecycleBinBytes
+if ($rbBytes -gt 0) {
+    Add-Finding (New-Finding -Category 'Recycle Bin' -Path 'Recycle Bin' -Item 'Deleted items' `
+        -SizeBytes $rbBytes -Age 0 -RecommendedAction "Empty Recycle Bin to reclaim space." `
+        -PlanCommand "Clear-RecycleBin -Force -WhatIf" -Confidence High)
 } else {
-    Add-Finding (New-Finding -Category 'Recycle Bin' -Path 'N/A' -Item 'Admin recommended' `
-        -SizeBytes 0 -Age 0 -RecommendedAction "Run elevated to estimate and empty Recycle Bin." `
-        -PlanCommand "Clear-RecycleBin -Force -WhatIf" -Confidence Medium -Notes 'Admin rights needed for accurate size')
+    Add-Finding (New-Finding -Category 'Recycle Bin' -Path 'Recycle Bin' -Item 'No measurable items or access denied' `
+        -SizeBytes 0 -Age 0 -RecommendedAction "If you expect items, run from an interactive user session." `
+        -PlanCommand "Clear-RecycleBin -Force -WhatIf" -Confidence Medium)
 }
 
-# 5) Windows.old
-foreach ($d in $Drives) {
-    $wo = Join-Path $d "Windows.old"
-    $res = Try-MeasurePath -Path $wo -Recurse
-    if ($res.Exists -and $res.Bytes -gt 0) {
-        Add-Finding (New-Finding -Category 'Previous Windows (Windows.old)' -Path $wo -Item 'Previous installation' `
-            -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Use Disk Cleanup/Storage Sense to remove safely." `
-            -PlanCommand "# Recommended via Settings > System > Storage > Temporary files (Windows.old)" `
-            -Confidence High -Notes 'Manual removal can be blocked; use built-in cleanup')
-    }
+# 5) Windows.old (Windows volume only)
+$wo = Join-Path $windowsDrive "Windows.old"
+$res = Try-MeasurePath -Path $wo
+if ($res.Exists -and $res.Bytes -gt 0) {
+    Add-Finding (New-Finding -Category 'Previous Windows (Windows.old)' -Path $wo -Item 'Previous installation' `
+        -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Use Disk Cleanup/Storage Sense to remove safely." `
+        -PlanCommand "# Recommended via Settings > System > Storage > Temporary files (Windows.old)" `
+        -Confidence High -Notes 'Manual removal can be blocked; use built-in cleanup')
 }
 
 # 6) Crash dumps
-$memDump = "C:\Windows\MEMORY.DMP"
+$memDump = Join-Path $windowsDrive "Windows\MEMORY.DMP"
 if (Test-Path $memDump) {
     try {
         $fi = Get-Item $memDump -Force
         Add-Finding (New-Finding -Category 'Crash Dumps' -Path $memDump -Item 'Kernel memory dump' `
             -SizeBytes $fi.Length -Age ([int]((New-TimeSpan -Start $fi.LastWriteTime -End $now).TotalDays)) `
             -RecommendedAction "Usually safe to delete if no longer needed for analysis." `
-            -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf" -f $memDump) -Confidence High)
+            -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf -ErrorAction SilentlyContinue" -f $memDump) -Confidence High)
     } catch {}
 }
-$miniDump = "C:\Windows\Minidump"
-$res = Try-MeasurePath -Path $miniDump -Recurse
+$miniDump = Join-Path $windowsDrive "Windows\Minidump"
+$res = Try-MeasurePath -Path $miniDump
 if ($res.Exists -and $res.Bytes -gt 0) {
     Add-Finding (New-Finding -Category 'Crash Dumps' -Path $miniDump -Item 'Minidumps' `
         -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Safe to delete if no longer needed." `
-        -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf" -f $miniDump) -Confidence High)
+        -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue" -f $miniDump) -Confidence High)
 }
 
 # 7) Thumbnail caches
 foreach ($u in Get-UserProfileRoots) {
     $thumb = Join-Path $u "AppData\Local\Microsoft\Windows\Explorer"
-    $res = Try-MeasurePath -Path $thumb -Recurse -Include @('thumbcache*')
+    $res = Try-MeasurePath -Path $thumb -Include @('thumbcache*')
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Thumbnail Cache' -Path $thumb -Item 'thumbcache*' `
             -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Safe to clear; Windows will regenerate." `
-            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Filter 'thumbcache*' | Remove-Item -Force -WhatIf" -f $thumb) -Confidence High)
+            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Filter 'thumbcache*' | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $thumb) -Confidence High)
     }
 }
 
@@ -279,7 +318,7 @@ foreach ($u in Get-UserProfileRoots) {
                     Add-Finding (New-Finding -Category "Large/Old Files ($set)" -Path $f.DirectoryName -Item $f.Name `
                         -SizeBytes $f.Length -Age ([int]((New-TimeSpan -Start $f.LastWriteTime -End $now).TotalDays)) `
                         -RecommendedAction "Review & delete/move/archive if not needed." `
-                        -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf" -f $f.FullName) -Confidence Medium)
+                        -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf -ErrorAction SilentlyContinue" -f $f.FullName) -Confidence Medium)
                 }
             } catch {}
         }
@@ -299,7 +338,7 @@ foreach ($u in Get-UserProfileRoots) {
                 Add-Finding (New-Finding -Category 'Old Installers (Downloads)' -Path $f.DirectoryName -Item $f.Name `
                     -SizeBytes $f.Length -Age ([int]((New-TimeSpan -Start $f.LastWriteTime -End $now).TotalDays)) `
                     -RecommendedAction "Review & delete if no longer needed." `
-                    -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf" -f $f.FullName) -Confidence Medium)
+                    -PlanCommand ("Remove-Item -LiteralPath '{0}' -Force -WhatIf -ErrorAction SilentlyContinue" -f $f.FullName) -Confidence Medium)
             }
         } catch {}
     }
@@ -315,19 +354,21 @@ if ($IncludeDismAnalysis) {
             $out = Get-Content -LiteralPath $tmpOut -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
 
-            $potential = ($out | Select-String -Pattern 'Recommended Cleanup\s*:\s*(Yes|No)').Matches.Value -join '; '
-            $sizeLine  = ($out | Select-String -Pattern 'WinSxS Directory Size|Cache.*Size|Size\s*:\s*').Line -join '; '
-            Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path 'C:\Windows\WinSxS' -Item 'DISM analysis' `
+            $recoLine = ($out | Select-String -Pattern 'Recommended Cleanup\s*:\s*(Yes|No)' -AllMatches | Select-Object -Last 1).Matches.Value
+            $wxsSize  = ($out | Select-String -Pattern 'WinSxS Directory Size\s*:\s*(.+)$' | Select-Object -Last 1).Matches.Groups[1].Value
+            $notes = "Recommended: $recoLine; WinSxS size: $wxsSize"
+
+            Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path (Join-Path $windowsDrive 'Windows\WinSxS') -Item 'DISM analysis' `
                 -SizeBytes 0 -Age 0 -RecommendedAction "If recommended, run 'DISM /Online /Cleanup-Image /StartComponentCleanup'." `
                 -PlanCommand "# DISM cleanup (preview-only): DISM /Online /Cleanup-Image /StartComponentCleanup" `
-                -Confidence High -Notes ("{0}; {1}" -f $potential,$sizeLine))
+                -Confidence High -Notes $notes)
         } catch {
-            Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path 'C:\Windows\WinSxS' -Item 'DISM analysis failed' `
+            Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path (Join-Path $windowsDrive 'Windows\WinSxS') -Item 'DISM analysis failed' `
                 -SizeBytes 0 -Age 0 -RecommendedAction "Run elevated PowerShell/Terminal and retry." `
                 -PlanCommand "" -Confidence Low -Notes $_.Exception.Message)
         }
     } else {
-        Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path 'C:\Windows\WinSxS' -Item 'Admin required' `
+        Add-Finding (New-Finding -Category 'Component Store (WinSxS)' -Path (Join-Path $windowsDrive 'Windows\WinSxS') -Item 'Admin required' `
             -SizeBytes 0 -Age 0 -RecommendedAction "Run elevated to analyze with DISM." `
             -PlanCommand "" -Confidence Medium)
     }
@@ -353,7 +394,7 @@ if ($admin) {
         -PlanCommand "" -Confidence Low)
 }
 
-# 12) Optional duplicate scan (hash-based)
+# 12) Optional duplicate scan (size-grouped, then hash)
 if ($IncludeDupScan) {
     $contentRoots = @()
     foreach ($u in Get-UserProfileRoots) {
@@ -367,28 +408,33 @@ if ($IncludeDupScan) {
     }
     $contentRoots = $contentRoots | Where-Object { Test-Path $_ } | Select-Object -Unique
     Write-Host "Duplicate scan: hashing files >= $LargeFileMinMB MB. This may take a while..."
+
+    $files = foreach ($root in $contentRoots) {
+        Get-ChildItem -LiteralPath $root -File -Force -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -ge ($LargeFileMinMB * 1MB) }
+    }
+
+    $byLen = $files | Group-Object Length | Where-Object { $_.Count -gt 1 }
+
     $hashTable = @{}
-    foreach ($root in $contentRoots) {
-        try {
-            Get-ChildItem -LiteralPath $root -File -Force -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -ge ($LargeFileMinMB * 1MB) } |
-                ForEach-Object {
-                    try {
-                        $h = Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName -ErrorAction Stop
-                        if (-not $hashTable.ContainsKey($h.Hash)) { $hashTable[$h.Hash] = New-Object System.Collections.Generic.List[object] }
-                        $hashTable[$h.Hash].Add($_)
-                    } catch {}
-                }
-        } catch {}
+    foreach ($grp in $byLen) {
+        foreach ($f in $grp.Group) {
+            try {
+                # SHA1 is adequate and faster for dedupe
+                $h = Get-FileHash -Algorithm SHA1 -LiteralPath $f.FullName -ErrorAction Stop
+                if (-not $hashTable.ContainsKey($h.Hash)) { $hashTable[$h.Hash] = New-Object System.Collections.Generic.List[object] }
+                $hashTable[$h.Hash].Add($f)
+            } catch {}
+        }
     }
     foreach ($k in $hashTable.Keys) {
-        $files = $hashTable[$k]
-        if ($files.Count -gt 1) {
-            $ordered = $files | Sort-Object Length -Descending
+        $filesDup = $hashTable[$k]
+        if ($filesDup.Count -gt 1) {
+            $ordered = $filesDup | Sort-Object Length -Descending
             $savings = ($ordered | Select-Object -Skip 1 | Measure-Object -Sum Length).Sum
             if ($savings -gt 0) {
                 $list = ($ordered | ForEach-Object { $_.FullName }) -join "`n"
-                Add-Finding (New-Finding -Category 'Duplicates (hash match)' -Path 'various' -Item ("{0} duplicates" -f $files.Count) `
+                Add-Finding (New-Finding -Category 'Duplicates (hash match)' -Path 'various' -Item ("{0} duplicates" -f $filesDup.Count) `
                     -SizeBytes $savings -Age 0 -RecommendedAction "Review duplicates and remove extras." `
                     -PlanCommand "# Manually review duplicates:`n# $list" -Confidence Medium)
             }
@@ -399,73 +445,78 @@ if ($IncludeDupScan) {
 # 13) Disk Cleanup / Storage Sense "system files" parity (read-only)
 if ($IncludeSystemFileParity) {
     # Delivery Optimization cache
-    $doCache = "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
-    $res = Try-MeasurePath -Path $doCache -Recurse
+    $doCache = Join-Path $windowsDrive "ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
+    $res = Try-MeasurePath -Path $doCache
     if ($res.Exists -and $res.Bytes -gt 0) {
-        $planDO = ("Stop-Service DoSvc -Force -ErrorAction SilentlyContinue`n" +
-                   ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf`n" -f $doCache) +
-                   "Start-Service DoSvc -ErrorAction SilentlyContinue")
+        $planDO = @"
+Stop-Service DoSvc -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath '$doCache' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue
+Start-Service DoSvc -ErrorAction SilentlyContinue
+"@
         Add-Finding (New-Finding -Category 'Delivery Optimization' -Path $doCache -Item 'DO cache' `
             -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Usually safe to clear; Windows will re-fetch." `
             -PlanCommand $planDO -Confidence High)
     }
 
     # Windows Error Reporting (WER)
-    $werPaths = @("C:\ProgramData\Microsoft\Windows\WER\ReportArchive","C:\ProgramData\Microsoft\Windows\WER\ReportQueue")
+    $werPaths = @(
+        (Join-Path $windowsDrive "ProgramData\Microsoft\Windows\WER\ReportArchive"),
+        (Join-Path $windowsDrive "ProgramData\Microsoft\Windows\WER\ReportQueue")
+    )
     foreach ($p in $werPaths) {
-        $res = Try-MeasurePath -Path $p -Recurse
+        $res = Try-MeasurePath -Path $p
         if ($res.Exists -and $res.Bytes -gt 0) {
             Add-Finding (New-Finding -Category 'Windows Error Reporting' -Path $p -Item 'WER reports' `
                 -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Safe to clear error report archives." `
-                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf" -f $p) -Confidence High)
+                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue" -f $p) -Confidence High)
         }
     }
 
     # Windows upgrade leftovers ($WINDOWS.~BT / $WINDOWS.~WS) and Panther logs
-    $upgradeRoots = @('C:\$WINDOWS.~BT','C:\$WINDOWS.~WS')
+    $upgradeRoots = @((Join-Path $windowsDrive '$WINDOWS.~BT'), (Join-Path $windowsDrive '$WINDOWS.~WS'))
     foreach ($p in $upgradeRoots) {
-        $res = Try-MeasurePath -Path $p -OlderThanDays $AgeDays -Recurse
+        $res = Try-MeasurePath -Path $p -OlderThanDays $AgeDays
         if ($res.Exists -and $res.Bytes -gt 0) {
             Add-Finding (New-Finding -Category 'Windows Upgrade Leftovers' -Path $p -Item 'Old setup files' `
                 -SizeBytes $res.Bytes -Age $AgeDays -RecommendedAction "Safe to remove if no upgrade is pending." `
-                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf" -f $p) -Confidence Medium `
+                -PlanCommand ("Remove-Item -LiteralPath '{0}' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue" -f $p) -Confidence Medium `
                 -Notes 'Ensure no pending upgrades / rollback needed')
         }
     }
-    $panther = "C:\Windows\Panther"
-    $res = Try-MeasurePath -Path $panther -OlderThanDays $AgeDays -Recurse -Include @('*.log','*.etl','*.cab')
+    $panther = Join-Path $windowsDrive "Windows\Panther"
+    $res = Try-MeasurePath -Path $panther -OlderThanDays $AgeDays -Include @('*.log','*.etl','*.cab')
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Setup Logs (Panther)' -Path $panther -Item 'Old setup logs' `
             -SizeBytes $res.Bytes -Age $AgeDays -RecommendedAction "Safe to clear old setup logs." `
-            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.log,*.etl,*.cab | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf" -f $panther,$AgeDays) `
+            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.log,*.etl,*.cab | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $panther,$AgeDays) `
             -Confidence High)
     }
 
     # CBS logs (Windows servicing)
-    $cbs = "C:\Windows\Logs\CBS"
-    $res = Try-MeasurePath -Path $cbs -OlderThanDays $AgeDays -Recurse -Include @('*.log','*.cab')
+    $cbs = Join-Path $windowsDrive "Windows\Logs\CBS"
+    $res = Try-MeasurePath -Path $cbs -OlderThanDays $AgeDays -Include @('*.log','*.cab')
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Servicing Logs (CBS)' -Path $cbs -Item 'Old CBS logs' `
             -SizeBytes $res.Bytes -Age $AgeDays -RecommendedAction "Safe to clear old CBS logs when not troubleshooting." `
-            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.log,*.cab | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf" -f $cbs,$AgeDays) `
+            -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.log,*.cab | Where-Object LastWriteTime -lt (Get-Date).AddDays(-{1}) | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $cbs,$AgeDays) `
             -Confidence High)
     }
 
     # ESD installation files
-    $esdRoots     = @('C:\ESD','C:\$WINDOWS.~BT\Sources')
+    $esdRoots = @((Join-Path $windowsDrive 'ESD'), (Join-Path $windowsDrive '$WINDOWS.~BT\Sources'))
     foreach ($p in $esdRoots) {
-        $res = Try-MeasurePath -Path $p -Recurse -Include @('*.esd')
+        $res = Try-MeasurePath -Path $p -Include @('*.esd')
         if ($res.Exists -and $res.Bytes -gt 0) {
             Add-Finding (New-Finding -Category 'Windows ESD Packages' -Path $p -Item '*.esd' `
                 -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Review before removal; used for repair/upgrade." `
-                -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.esd | Remove-Item -Force -WhatIf" -f $p) `
+                -PlanCommand ("Get-ChildItem -LiteralPath '{0}' -Force -Recurse -Include *.esd | Remove-Item -Force -WhatIf -ErrorAction SilentlyContinue" -f $p) `
                 -Confidence Medium -Notes 'Only remove if you have media or won’t need in-place repair')
         }
     }
 
     # Defender definitions cache (report-only)
-    $defCache = "C:\ProgramData\Microsoft\Windows Defender\Definition Updates"
-    $res = Try-MeasurePath -Path $defCache -Recurse
+    $defCache = Join-Path $windowsDrive "ProgramData\Microsoft\Windows Defender\Definition Updates"
+    $res = Try-MeasurePath -Path $defCache
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'Defender Definitions' -Path $defCache -Item 'Definition cache' `
             -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Let Defender manage; avoid manual deletion." `
@@ -473,8 +524,8 @@ if ($IncludeSystemFileParity) {
     }
 
     # Device driver packages (DriverStore) – report-only; removal is risky
-    $driverStore = "C:\Windows\System32\DriverStore\FileRepository"
-    $res = Try-MeasurePath -Path $driverStore -Recurse
+    $driverStore = Join-Path $windowsDrive "Windows\System32\DriverStore\FileRepository"
+    $res = Try-MeasurePath -Path $driverStore
     if ($res.Exists -and $res.Bytes -gt 0) {
         Add-Finding (New-Finding -Category 'DriverStore' -Path $driverStore -Item 'Driver packages' `
             -SizeBytes $res.Bytes -Age 0 -RecommendedAction "Use Disk Cleanup or vendor tools; do not delete manually." `
@@ -493,7 +544,7 @@ body { font-family: Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
 h1,h2 { font-weight: 600; }
 .summary { margin: 12px 0 24px 0; padding: 12px 16px; border-left: 4px solid #4b8; background: #f6fffa; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ddd; padding: 8px; }
+th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
 th { background: #f3f4f6; text-align: left; }
 tr:nth-child(even) { background: #fafafa; }
 .code { font-family: Consolas, monospace; white-space: pre-wrap; background: #f8f8f8; padding: 8px; border-radius: 6px; }
@@ -508,19 +559,21 @@ $header = @"
   <div><b>Computer:</b> $env:COMPUTERNAME</div>
   <div><b>Run time:</b> $now</div>
   <div><b>Admin:</b> $admin</div>
-  <div><b>Parameters:</b> Drives=$($Drives -join ', '); AgeDays=$AgeDays; LargeFileMinMB=$LargeFileMinMB; Duplicates=$IncludeDupScan; DISM=$IncludeDismAnalysis; SystemParity=$IncludeSystemFileParity</div>
+  <div><b>Parameters:</b> Drives=$($validDrives -join ', '); AgeDays=$AgeDays; LargeFileMinMB=$LargeFileMinMB; Duplicates=$IncludeDupScan; DISM=$IncludeDismAnalysis; SystemParity=$IncludeSystemFileParity</div>
   <div><b>Potentially reclaimable (estimate):</b> $(Format-Size $totalBytes)</div>
 </div>
 "@
 
-$reportTable = $findings | Select-Object Category, Path, Item, Size, AgeDays, Confidence, RecommendedAction, Notes, PlanCommand |
+$reportTable = $findings |
+    Select-Object Category, Path, Item, Size, AgeDays, Confidence, RecommendedAction, Notes,
+                  @{n='PlanCommand';e={ $_.PlanCommand -replace '<','&lt;' -replace '>','&gt;' }} |
     ConvertTo-Html -As Table -Fragment
 
 $html = ConvertTo-Html -Head $style -Body ($header + $reportTable)
 
 # Write report
 $html | Out-File -LiteralPath $ReportPath -Encoding UTF8
-Write-Host "Report written to: $ReportPath"
+Write-Output "Report written to: $ReportPath"
 
 # Optional cleanup plan (all -WhatIf)
 if ($GenerateCleanupPlan) {
@@ -531,10 +584,30 @@ if ($GenerateCleanupPlan) {
 # All commands below include -WhatIf for safety. Review first; remove -WhatIf if/when you decide to execute.
 # Recommended: Create a Restore Point and close apps before running any cleanup.
 "@
-    $planContent = ($PlanCommands | Select-Object -Unique) -join "`r`n"
+    $planContent = ($PlanCommands | Where-Object { $_ } | Select-Object -Unique) -join "`r`n"
     ($planHeader + "`r`n" + $planContent + "`r`n") | Out-File -LiteralPath $PlanPath -Encoding UTF8
-    Write-Host "Preview cleanup plan written to: $PlanPath"
+    Write-Output "Preview cleanup plan written to: $PlanPath"
 }
 
 # Final console summary
-("{0} findings. Estimated reclaimable: {1}" -f $findings.Count, (Format-Size $totalBytes)) | Write-Host
+("{0} findings. Estimated reclaimable: {1}" -f $findings.Count, (Format-Size $totalBytes)) | Write-Output
+
+# Emit pipeline object for automation/testing
+$result = [PSCustomObject]@{
+    ComputerName = $env:COMPUTERNAME
+    RunAt        = $now
+    IsAdmin      = $admin
+    Parameters   = [PSCustomObject]@{
+        Drives               = $validDrives
+        AgeDays              = $AgeDays
+        LargeFileMinMB       = $LargeFileMinMB
+        IncludeDupScan       = [bool]$IncludeDupScan
+        IncludeDismAnalysis  = [bool]$IncludeDismAnalysis
+        IncludeSystemFileParity = [bool]$IncludeSystemFileParity
+    }
+    Findings     = $findings
+    TotalBytes   = $totalBytes
+    ReportPath   = $ReportPath
+    PlanPath     = $GenerateCleanupPlan ? $PlanPath : $null
+}
+$result
